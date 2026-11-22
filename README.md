@@ -2,6 +2,9 @@
 
 [NDLOCR-Lite](https://github.com/ndl-lab/ndlocr-lite) を `uv tool install .` で導入した環境で、**`ndlocr-lite` コマンドを利用して PDF を OCR し、認識テキストを透明テキストとして埋め込んだ検索可能 PDF（Searchable PDF）を作成する CLI ツール**です。
 
+- **二重埋め込み（二重検索）防止機能**:
+  - **デフォルトで自動スキップ**: すでにテキストが埋め込まれている PDF は自動的にスキップします。また、フォルダ一括処理時には出力済みの `*_ocr.pdf` を自動的に除外します。
+  - **既存テキストを消去して再 OCR（`--redo-ocr`）**: 既存の透明テキストをやり直したい場合は、`--redo-ocr` を指定すると元の PDF から既存のテキストレイヤー（`BT...ET`）を完全に除去した上で新しい透明テキストを埋め込むため、検索時に同じ箇所が二重にヒットすることがありません。
 - **ローカルパスへのハードコードなし**: `uv tool install .` で導入された `ndlocr-lite` コマンドを直接呼び出すため、`ndlocr-lite` のクローン先ディレクトリに依存しません。
 - **軽量な依存関係**: プロジェクト自体の依存ライブラリは `pypdf` のみで、`uv sync` が一瞬で完了します。
 - **単一 PDF・フォルダ一括処理対応**: `ndlocr-lite` 標準 CLI では中間ファイル出力用の `--output` ディレクトリ指定が必須ですが、本ツールでは一時ディレクトリを自動管理し、目的のテキスト埋め込み PDF のみをシンプルに出力します。
@@ -53,24 +56,33 @@ uv run ndlpdf input.pdf
 ```
 
 デフォルトでは同じフォルダに `input_ocr.pdf` が生成されます（一時ファイルや不要な JSON/XML は残りません）。
+※ `input.pdf` にすでにテキストが埋め込まれている場合は自動でスキップされます。
 
-### 2. 出力ファイル名（または出力先フォルダ）を指定する
+### 2. 既存の透明テキストを消去して再 OCR する（二重検索防止）
+
+すでに別の OCR ソフトや過去の実行で透明テキストが入っている PDF を再 OCR したい場合は `--redo-ocr` を指定します。既存の埋め込みテキストを除去してから新しく透明テキストを埋め込むため、検索時に二重ヒットしません。
+
+```bash
+uv run ndlpdf input_with_text.pdf --redo-ocr
+```
+
+### 3. 出力ファイル名（または出力先フォルダ）を指定する
 
 ```bash
 uv run ndlpdf input.pdf -o output.pdf
 ```
 
-### 3. フォルダ内の PDF を一括変換する
+### 4. フォルダ内の PDF を一括変換する
 
 ```bash
-# input_dir 内の PDF をすべて OCR し、output_dir に出力
+# input_dir 内のテキスト未埋め込み PDF をすべて OCR し、output_dir に出力
 uv run ndlpdf ./input_dir -o ./output_dir
 
-# サブフォルダも含めて再帰的に処理し、既にテキストがある PDF はスキップ
-uv run ndlpdf ./input_dir -r --skip-existing-text -o ./output_dir
+# サブフォルダも含めて再帰的に処理
+uv run ndlpdf ./input_dir -r -o ./output_dir
 ```
 
-### 4. 解像度（DPI）や副産物出力の指定
+### 5. 解像度（DPI）や副産物出力の指定
 
 ```bash
 # 300 DPI で OCR し、テキストファイル (.txt) も同時に出力
@@ -94,7 +106,8 @@ uv run ndlpdf input.pdf --dpi 300 --save-text
 | `--save-text` | OCR 結果のプレーンテキスト（`.txt`）も同時に保存する |
 | `--save-json` | OCR 結果の座標付き JSON（`.json`）も同時に保存する |
 | `--save-xml` | OCR 結果の XML（`.xml`）も同時に保存する |
-| `--skip-existing-text` | すでにテキストが埋め込まれている PDF は処理をスキップする |
+| `--skip-existing-text` / `--no-skip-existing-text` | すでにテキストが埋め込まれている PDF をスキップする（デフォルト: 有効） |
+| `--redo-ocr` | すでにテキストが埋め込まれている PDF でも、既存テキストを除去してから再 OCR して置き換える |
 | `--overwrite` | 出力先ファイルが既に存在する場合に上書きする |
 | `--in-place` | 元の PDF ファイルを直接テキスト埋め込み PDF で上書きする |
 | `--ndlocr-cmd <CMD>` | 使用する `ndlocr-lite` コマンド名またはパス（デフォルト: `ndlocr-lite`） |
@@ -104,4 +117,3 @@ uv run ndlpdf input.pdf --dpi 300 --save-text
 ## ライセンス
 
 [MIT License](./LICENSE)
-

@@ -11,6 +11,7 @@ from ndlpdf import (
     main,
     resolve_ndlocr_command,
     resolve_output_pdf_path,
+    strip_embedded_text_from_pdf,
 )
 
 
@@ -67,19 +68,20 @@ class NdlPdfTests(unittest.TestCase):
             Path("/tmp/outdir/doc_ocr.pdf"),
         )
 
-    def test_end_to_end_ocr_and_embedded_text(self):
+    def test_end_to_end_ocr_and_prevent_duplicate_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             input_pdf = tmp_dir / "sample_scan.pdf"
             output_pdf = tmp_dir / "sample_scan_ocr.pdf"
+            redo_pdf = tmp_dir / "sample_scan_redo.pdf"
 
             _create_test_image_pdf(input_pdf)
 
             self.assertFalse(has_embedded_text(input_pdf))
-            collected = collect_pdf_files([str(tmp_dir)])
+            collected = collect_pdf_files([str(tmp_dir)], exclude_suffix="_ocr")
             self.assertEqual(len(collected), 1)
 
-            # CLI main() を実行して ndlocr-lite コマンド経由で OCR テキスト埋め込み PDF を作成
+            # 1. 初回 OCR
             exit_code = main(
                 [
                     str(input_pdf),
@@ -96,9 +98,32 @@ class NdlPdfTests(unittest.TestCase):
 
             # 生成された PDF から埋め込みテキストが抽出できることを確認
             self.assertTrue(has_embedded_text(output_pdf))
-            reader = PdfReader(str(output_pdf))
-            extracted = reader.pages[0].extract_text()
-            self.assertIn("国立国会図書館", extracted)
+            reader1 = PdfReader(str(output_pdf))
+            extracted1 = reader1.pages[0].extract_text()
+            self.assertIn("国立国会図書館", extracted1)
+            self.assertEqual(extracted1.count("国立国会図書館"), 1)
+
+            # 2. 既に透明テキストがある PDF を再度デフォルト実行するとスキップされること
+            skip_out = tmp_dir / "should_not_be_created.pdf"
+            exit_code_skip = main([str(output_pdf), "-o", str(skip_out)])
+            self.assertEqual(exit_code_skip, 0)
+            self.assertFalse(skip_out.exists())
+
+            # 3. 既存テキストの除去関数単体の検証
+            stripped_pdf = tmp_dir / "stripped.pdf"
+            strip_embedded_text_from_pdf(output_pdf, stripped_pdf)
+            self.assertFalse(has_embedded_text(stripped_pdf))
+
+            # 4. --redo-ocr で再 OCR したときに既存テキストが除去され、二重に埋め込まれないこと
+            exit_code_redo = main(
+                [str(output_pdf), "-o", str(redo_pdf), "--redo-ocr"]
+            )
+            self.assertEqual(exit_code_redo, 0)
+            self.assertTrue(redo_pdf.exists())
+            reader2 = PdfReader(str(redo_pdf))
+            extracted2 = reader2.pages[0].extract_text()
+            self.assertIn("国立国会図書館", extracted2)
+            self.assertEqual(extracted2.count("国立国会図書館"), 1)
 
 
 if __name__ == "__main__":

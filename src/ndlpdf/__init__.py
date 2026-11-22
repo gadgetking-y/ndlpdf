@@ -10,7 +10,8 @@ import tempfile
 import time
 from typing import Sequence
 
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ContentStream, NameObject
 
 
 @dataclass
@@ -23,7 +24,8 @@ class OcrConfig:
     save_text: bool = False
     save_json: bool = False
     save_xml: bool = False
-    skip_existing_text: bool = False
+    skip_existing_text: bool = True
+    redo_ocr: bool = False
     overwrite: bool = False
     suffix: str = "_ocr"
 
@@ -61,6 +63,44 @@ def has_embedded_text(pdf_path: Path) -> bool:
     return False
 
 
+def strip_embedded_text_from_pdf(input_pdf: Path, output_pdf: Path) -> None:
+    """PDF の各ページから既存の埋め込みテキスト（BT ... ET ブロック）を除去して保存する。
+
+    スキャン画像（XObject Do 等）やベクターグラフィックスはそのまま保持し、
+    テキスト描画オペレータのみを取り除くことで、再 OCR 時にテキストが二重に検索されるのを防ぐ。
+    """
+    reader = PdfReader(str(input_pdf))
+    writer = PdfWriter()
+
+    for page in reader.pages:
+        writer.add_page(page)
+
+    for page in writer.pages:
+        contents = page.get_contents()
+        if contents is None:
+            continue
+        stream = ContentStream(contents, writer)
+        new_operations = []
+        in_text_block = False
+        for operands, operator in stream.operations:
+            if operator == b"BT":
+                in_text_block = True
+                continue
+            if operator == b"ET":
+                in_text_block = False
+                continue
+            if in_text_block:
+                continue
+            if operator in (b"Tj", b"TJ", b"'", b'"'):
+                continue
+            new_operations.append((operands, operator))
+        stream.operations = new_operations
+        page[NameObject("/Contents")] = stream
+
+    with output_pdf.open("wb") as wf:
+        writer.write(wf)
+
+
 def get_pdf_page_count(pdf_path: Path) -> int:
     """PDF のページ数を取得する。"""
     try:
@@ -70,7 +110,11 @@ def get_pdf_page_count(pdf_path: Path) -> int:
         return 0
 
 
-def collect_pdf_files(inputs: Sequence[str], recursive: bool = False) -> list[Path]:
+def collect_pdf_files(
+    inputs: Sequence[str],
+    recursive: bool = False,
+    exclude_suffix: str | None = None,
+) -> list[Path]:
     """指定されたファイルやディレクトリから PDF ファイル一覧を取得する。"""
     pdf_files: list[Path] = []
     seen: set[Path] = set()
@@ -92,6 +136,11 @@ def collect_pdf_files(inputs: Sequence[str], recursive: bool = False) -> list[Pa
             for pattern in patterns:
                 for candidate in sorted(path.glob(pattern)):
                     if candidate.is_file():
+                        if (
+                            exclude_suffix
+                            and candidate.stem.endswith(exclude_suffix)
+                        ):
+                            continue
                         resolved = candidate.resolve()
                         if resolved not in seen:
                             seen.add(resolved)
@@ -148,10 +197,19 @@ class NdlOcrPdfProcessor:
             tmp_dir = Path(tmp_dir_str)
             tmp_pdf_output = tmp_dir / f"{input_pdf.stem}_text.pdf"
 
+            # 既に埋め込みテキストがある PDF に対して再 OCR を行う場合、
+            # 二重に透明テキストが重なって検索時に2重ヒットするのを防ぐため、
+            # 事前に既存のテキストレイヤーを除去した PDF を作成してから OCR に渡す。
+            source_pdf_for_ocr = input_pdf
+            if has_embedded_text(input_pdf):
+                stripped_pdf = tmp_dir / f"{input_pdf.stem}_stripped.pdf"
+                strip_embedded_text_from_pdf(input_pdf, stripped_pdf)
+                source_pdf_for_ocr = stripped_pdf
+
             cmd = [
                 self._ndlocr_bin,
                 "--sourcepdf",
-                str(input_pdf),
+                str(source_pdf_for_ocr),
                 "--output",
                 str(tmp_dir),
                 "--pdf-output",
@@ -184,7 +242,7 @@ class NdlOcrPdfProcessor:
             shutil.move(str(tmp_pdf_output), str(output_pdf))
 
             # オプションの副産物出力 (.txt / .json / .xml)
-            self._copy_sidecar_files(input_pdf.stem, tmp_dir, output_pdf)
+            self._copy_sidecar_files(source_pdf_for_ocr.stem, tmp_dir, output_pdf)
 
         elapsed = time.time() - start_time
         page_count = get_pdf_page_count(output_pdf)
@@ -280,8 +338,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--skip-existing-text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="すでにテキストが埋め込まれている PDF は処理をスキップする（デフォルト: 有効）",
+    )
+    parser.add_argument(
+        "--redo-ocr",
         action="store_true",
-        help="すでにテキストが埋め込まれている PDF は処理をスキップする",
+        help="すでにテキストが埋め込まれている PDF でも、既存のテキストを除去してから再 OCR して置き換える（二重検索を防止）",
     )
     parser.add_argument(
         "--overwrite",
@@ -307,7 +371,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        pdf_files = collect_pdf_files(args.inputs, recursive=args.recursive)
+        pdf_files = collect_pdf_files(
+            args.inputs,
+            recursive=args.recursive,
+            exclude_suffix=args.suffix if not args.in_place else None,
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
@@ -315,6 +383,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not pdf_files:
         print("[WARN] 処理対象の PDF ファイルが見つかりませんでした。", file=sys.stderr)
         return 1
+
+    skip_existing = args.skip_existing_text and not args.redo_ocr
 
     config = OcrConfig(
         ndlocr_cmd=args.ndlocr_cmd,
@@ -325,7 +395,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         save_text=args.save_text,
         save_json=args.save_json,
         save_xml=args.save_xml,
-        skip_existing_text=args.skip_existing_text,
+        skip_existing_text=skip_existing,
+        redo_ocr=args.redo_ocr,
         overwrite=args.overwrite or args.in_place,
         suffix=args.suffix,
     )
@@ -346,7 +417,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for input_pdf in pdf_files:
         if config.skip_existing_text and has_embedded_text(input_pdf):
-            print(f"[SKIP] 既にテキストが含まれています: {input_pdf}")
+            print(
+                f"[SKIP] 既にテキストが埋め込まれているためスキップしました "
+                f"（既存テキストを消去して再OCRする場合は --redo-ocr を指定してください）: {input_pdf}"
+            )
             skip_count += 1
             continue
 
